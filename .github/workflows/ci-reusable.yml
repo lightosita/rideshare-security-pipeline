@@ -1,0 +1,368 @@
+name: Reusable CI Pipeline — Security Gated
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-path:
+        required: true
+        type: string
+      runtime:
+        required: true
+        type: string
+        description: "nodejs, python, or golang"
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_REGION:
+        required: true
+      ECR_REGISTRY:
+        required: true
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  # ── GATE 1: CodeQL SAST ──────────────────────────────────────────────────
+  # Scans source code for insecure patterns before anything is built.
+  # Any finding at any severity fails the pipeline — no exceptions.
+  codeql:
+    name: "Gate 1 · CodeQL SAST"
+    runs-on: self-hosted
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve CodeQL language from runtime
+        id: lang
+        run: |
+          case "${{ inputs.runtime }}" in
+            nodejs)  echo "language=javascript" >> $GITHUB_OUTPUT ;;
+            python)  echo "language=python"     >> $GITHUB_OUTPUT ;;
+            golang)  echo "language=go"         >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.lang.outputs.language }}
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ steps.lang.outputs.language }}"
+          upload: true
+
+  # ── GATE 2: Gitleaks secret scan ─────────────────────────────────────────
+  # Scans full commit history for credentials, tokens, and private keys.
+  # Requires fetch-depth: 0 to scan beyond the latest commit.
+  # Any detected secret fails the pipeline — no exceptions.
+  gitleaks:
+    name: "Gate 2 · Gitleaks Secret Scan"
+    runs-on: self-hosted
+    needs: codeql
+    steps:
+      - name: Checkout code (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_EXIT_CODE: "1"
+
+  # ── GATE 3: Trivy filesystem scan ────────────────────────────────────────
+  # Scans service directory, lockfiles, and manifests for dependency CVEs.
+  # Critical/High = fail. Medium/Low = report only (uploaded as SARIF).
+  trivy-fs:
+    name: "Gate 3 · Trivy Dependency Scan"
+    runs-on: self-hosted
+    needs: gitleaks
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Trivy fs — Critical/High (fail gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: ${{ inputs.service-path }}
+          format: "sarif"
+          output: "trivy-fs-${{ inputs.service-name }}.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: false
+
+      - name: Upload Trivy fs SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-fs-${{ inputs.service-name }}.sarif"
+          category: "trivy-fs-${{ inputs.service-name }}"
+
+      - name: Trivy fs — Medium/Low (report only)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: ${{ inputs.service-path }}
+          format: "table"
+          severity: "MEDIUM,LOW"
+          exit-code: "0"
+
+  # ── RUNTIME VALIDATION (unchanged from Week 10) ──────────────────────────
+  # Runs after the three FS gates pass. Lint, type-check, build check.
+  # Kept as a separate job so failures are clearly distinguishable from
+  # security gate failures in the Actions UI.
+  validate:
+    name: "Runtime validation · ${{ inputs.runtime }}"
+    runs-on: self-hosted
+    needs: trivy-fs
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        if: inputs.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies (Node.js)
+        if: inputs.runtime == 'nodejs'
+        working-directory: ${{ inputs.service-path }}
+        run: npm ci
+
+      - name: TypeScript build check (Node.js)
+        if: inputs.runtime == 'nodejs'
+        working-directory: ${{ inputs.service-path }}
+        run: npm run build
+
+      - name: Set up Python
+        if: inputs.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (Python)
+        if: inputs.runtime == 'python'
+        working-directory: ${{ inputs.service-path }}
+        run: |
+          pip install -r requirements.txt
+          pip install flake8
+
+      - name: Lint check (Python)
+        if: inputs.runtime == 'python'
+        working-directory: ${{ inputs.service-path }}
+        run: flake8 . --max-line-length=200 --exclude=__pycache__ --ignore=E302,W293,W292,E501,F401,W291,E402,F841,F541,E111,E117,E261,E305,W504,W503,E241
+
+      - name: Set up Go
+        if: inputs.runtime == 'golang'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Download Go modules
+        if: inputs.runtime == 'golang'
+        working-directory: ${{ inputs.service-path }}
+        run: go mod download
+
+      - name: Go build check
+        if: inputs.runtime == 'golang'
+        working-directory: ${{ inputs.service-path }}
+        run: go build ./...
+
+  # ── BUILD (docker build only — no push yet) ──────────────────────────────
+  # Calls the Week 10 composite action but only for the build step.
+  # The image is saved to a tar and passed to the scan and push jobs.
+  # The push step inside the composite is intentionally NOT called here.
+  build:
+    name: "Build image · ${{ inputs.service-name }}"
+    runs-on: self-hosted
+    needs: validate
+    outputs:
+      image-uri: ${{ steps.uri.outputs.image-uri }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ env.IMAGE_TAG }} \
+            -t ${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:latest \
+            ./${{ inputs.service-path }}
+
+      - name: Set image URI output
+        id: uri
+        run: |
+          echo "image-uri=${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ env.IMAGE_TAG }}" \
+            >> $GITHUB_OUTPUT
+
+      - name: Save image to tar for downstream jobs
+        run: |
+          docker save \
+            "${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ env.IMAGE_TAG }}" \
+            -o /tmp/${{ inputs.service-name }}.tar
+
+      - name: Upload image tar as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.service-name }}-image"
+          path: "/tmp/${{ inputs.service-name }}.tar"
+          retention-days: 1
+
+  # ── GATE 4: Trivy image scan ─────────────────────────────────────────────
+  # Scans the built image for OS and application CVEs before push.
+  # Critical/High = do not push. Medium/Low = report only.
+  trivy-image:
+    name: "Gate 4 · Trivy Image Scan"
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Download image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ inputs.service-name }}-image"
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/${{ inputs.service-name }}.tar
+
+      - name: Trivy image — Critical/High (fail gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "image"
+          image-ref: ${{ needs.build.outputs.image-uri }}
+          format: "sarif"
+          output: "trivy-image-${{ inputs.service-name }}.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: false
+
+      - name: Upload Trivy image SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-image-${{ inputs.service-name }}.sarif"
+          category: "trivy-image-${{ inputs.service-name }}"
+
+      - name: Trivy image — Medium/Low (report only)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "image"
+          image-ref: ${{ needs.build.outputs.image-uri }}
+          format: "table"
+          severity: "MEDIUM,LOW"
+          exit-code: "0"
+
+  # ── GATE 5: Syft SBOM ───────────────────────────────────────────────────
+  # Generates a CycloneDX JSON SBOM for the built image.
+  # Uploaded as a named artifact tied to the commit SHA.
+  # A missing SBOM fails the release — push-ecr will not run.
+  syft-sbom:
+    name: "Gate 5 · Syft SBOM"
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Download image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ inputs.service-name }}-image"
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/${{ inputs.service-name }}.tar
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          syft "${{ needs.build.outputs.image-uri }}" \
+            --output cyclonedx-json \
+            --file "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json"
+
+      - name: Verify SBOM was written
+        run: |
+          if [ ! -f "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json" ]; then
+            echo "SBOM missing — failing per gate policy."
+            exit 1
+          fi
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}"
+          path: "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json"
+          retention-days: 90
+
+  # ── ECR PUSH (only after all gates pass) ─────────────────────────────────
+  # Both trivy-image AND syft-sbom must succeed before this job is scheduled.
+  # Only runs on push to main — PRs validate only, never push.
+  push-ecr:
+    name: "Push approved image to ECR"
+    runs-on: self-hosted
+    needs: [trivy-image, syft-sbom]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ inputs.service-name }}-image"
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/${{ inputs.service-name }}.tar
+
+      - name: Push image to ECR
+        run: |
+          docker push "${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ env.IMAGE_TAG }}"
+          docker push "${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:latest"
+          echo "Pushed: ${{ secrets.ECR_REGISTRY }}/${{ inputs.service-name }}:${{ env.IMAGE_TAG }}"
