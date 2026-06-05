@@ -101,7 +101,7 @@ jobs:
           fetch-depth: 1
 
       - name: Trivy fs — Critical/High (fail gate)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: "fs"
           scan-ref: ${{ inputs.service-path }}
@@ -120,7 +120,7 @@ jobs:
 
       - name: Trivy fs — Medium/Low (report only)
         if: always()
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: "fs"
           scan-ref: ${{ inputs.service-path }}
@@ -263,7 +263,7 @@ jobs:
         run: docker load -i /tmp/${{ inputs.service-name }}.tar
 
       - name: Trivy image — Critical/High (fail gate)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: "image"
           image-ref: ${{ needs.build.outputs.image-uri }}
@@ -282,7 +282,7 @@ jobs:
 
       - name: Trivy image — Medium/Low (report only)
         if: always()
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: "image"
           image-ref: ${{ needs.build.outputs.image-uri }}
@@ -308,30 +308,13 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/${{ inputs.service-name }}.tar
 
-      - name: Install Syft
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b /usr/local/bin
-
-      - name: Generate CycloneDX SBOM
-        run: |
-          syft "${{ needs.build.outputs.image-uri }}" \
-            --output cyclonedx-json \
-            --file "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json"
-
-      - name: Verify SBOM was written
-        run: |
-          if [ ! -f "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json" ]; then
-            echo "SBOM missing — failing per gate policy."
-            exit 1
-          fi
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+      - name: Generate and upload CycloneDX SBOM
+        uses: anchore/sbom-action@v0.17.9
         with:
-          name: "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}"
-          path: "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json"
-          retention-days: 90
+          image: ${{ needs.build.outputs.image-uri }}
+          format: cyclonedx-json
+          artifact-name: "sbom-${{ inputs.service-name }}-${{ env.IMAGE_TAG }}.cdx.json"
+          upload-artifact-retention: 90
 
   # ── ECR PUSH (only after all gates pass) ─────────────────────────────────
   # Both trivy-image AND syft-sbom must succeed before this job is scheduled.

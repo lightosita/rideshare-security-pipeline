@@ -24,37 +24,45 @@ has a thin caller workflow that passes only its service name, path, and runtime.
 This means the security policy is defined once and enforced consistently across all services.
 
 
-\`\`\`
-                ┌─────────────┐
-                │   codeql    │  Gate 1 — SAST
-                └──────┬──────┘
-                       │
-                ┌──────▼──────┐
-                │  gitleaks   │  Gate 2 — Secret scan
-                └──────┬──────┘
-                       │
-                ┌──────▼──────┐
-                │  trivy-fs   │  Gate 3 — Dependency scan
-                └──────┬──────┘
-                       │
-                ┌──────▼──────┐
-                │    build    │  docker build (composite action, build only)
-                └──────┬──────┘
-                       │
-          ┌────────────┴────────────┐
-          │                         │
-   ┌──────▼──────┐           ┌──────▼──────┐
-   │ trivy-image │           │  syft-sbom  │  Gates 4 & 5 (parallel)
-   └──────┬──────┘           └──────┬──────┘
-          │                         │
-          └────────────┬────────────┘
-                       │  both must pass
-                ┌──────▼──────┐
-                │  push-ecr   │  docker push (main branch only)
-                └─────────────┘
+┌─────────────┐
+│   codeql    │  Gate 1 — SAST
+└──────┬──────┘
+       │
+┌──────▼──────┐
+│  gitleaks   │  Gate 2 — Secret scan
+└──────┬──────┘
+       │
+┌──────▼──────┐
+│  trivy-fs   │  Gate 3 — Dependency scan
+└──────┬──────┘
+       │
+┌──────▼──────┐
+│  validate   │  Runtime validation (Week 10 carry-over)
+└──────┬──────┘
+       │
+┌──────▼──────┐
+│    build    │  docker build
+└──────┬──────┘
+       │
+┌──────┴──────────────┐
+│                     │
+┌──────▼──────┐  ┌──────▼──────┐
+│ trivy-image │  │  syft-sbom  │  Gates 4 & 5 (parallel)
+└──────┬──────┘  └──────┬──────┘
+       │                │
+       └────────┬────────┘
+                │  both must pass
+         ┌──────▼──────┐
+         │  push-ecr   │  main branch only
+         └─────────────┘
 
-\`\`\`
                 ---
+> **Note on the `validate` job:** Runtime validation (lint, type-check, and build check)
+> is carried forward from the Week 10 pipeline and runs after `trivy-fs` passes and
+> before the Docker build. This is intentional — there is no value building an image
+> for a service that fails its own build check. A lint failure is clearly distinguishable
+> from a security gate failure in the Actions UI because each job is separately named.
+> The `validate` job does not replace or alter any of the five required security gates.
 
 ## Services secured
 
@@ -103,7 +111,7 @@ Scans service directories, lockfiles, and dependency manifests for known CVEs be
 the image is built. Covers `package-lock.json` (Node.js), `requirements.txt` (Python),
 and `go.sum` (Go). Critical and High findings fail the pipeline. Medium and Low are
 reported only and uploaded as SARIF artifacts to the Security tab.
-
+   
 ### Gate 4 — Trivy image scan
 
 Scans the built container image for OS-level and application-level CVEs — packages
